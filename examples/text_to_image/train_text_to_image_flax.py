@@ -1,7 +1,9 @@
+from clu import metric_writers
 import argparse
 import logging
 import math
 import os
+import time
 import random
 from pathlib import Path
 
@@ -230,7 +232,7 @@ def get_params_to_save(params):
     return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
 
 
-def main():
+def main(start_time_sec):
     args = parse_args()
 
     logging.basicConfig(
@@ -416,6 +418,7 @@ def main():
     # Initialize our training
     rng = jax.random.PRNGKey(args.seed)
     train_rngs = jax.random.split(rng, jax.local_device_count())
+    clu_writer = metric_writers.create_default_writer(args.output_dir)
 
     def train_step(state, text_encoder_params, vae_params, batch, train_rng):
         dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
@@ -507,11 +510,16 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     global_step = 0
+    train_time = 0
+
+    startup_time_sec = time.time() - start_time_sec
+    logger.warning(f'====== The startup time is: {startup_time_sec} ======')
 
     epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
     for epoch in epochs:
         # ======================== Training ================================
 
+        train_start = time.time()
         train_metrics = []
 
         steps_per_epoch = len(train_dataset) // total_train_batch_size
@@ -527,6 +535,24 @@ def main():
             global_step += 1
             if global_step >= args.max_train_steps:
                 break
+            
+            if global_step == args.max_train_steps - 100:
+                jax.profiler.start_trace("/tmp/jax_profiles")
+            if global_step == args.max_train_steps - 80:
+                jax.profiler.stop_trace()
+
+        train_time += time.time() - train_start
+        steps_per_sec = (epoch + 1) * steps_per_epoch / train_time
+        step_time_sec = 1 / steps_per_sec
+        examples_per_sec = steps_per_sec * total_train_batch_size
+
+        # Save metrics
+        if jax.process_index() == 0:
+            clu_metrics = {}
+            clu_metrics["steps_per_sec_per_device"] = steps_per_sec
+            clu_metrics["step_time_sec_per_device"] = step_time_sec
+            clu_metrics["global_examples_per_sec"] = examples_per_sec
+            clu_writer.write_scalars(epoch, clu_metrics)
 
         train_metric = jax_utils.unreplicate(train_metric)
 
@@ -571,4 +597,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    start_time_sec = time.time()
+    main(start_time_sec)
+    wall_time_sec = time.time() - start_time_sec
+    logger.warning(f'====== The wall time is: {wall_time_sec} ======')
